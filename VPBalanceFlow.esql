@@ -1,0 +1,660 @@
+
+
+
+DECLARE VPL_EBUSPR_REQUEST_MCS_Q SHARED CHARACTER 'a2';
+DECLARE VPL_EBUSPR_REPLY1_MCS_Q SHARED CHARACTER 'b2' ;
+DECLARE VPL_EBUSPR_REQUEST2_MCS SHARED CHARACTER 'c2' ;
+DECLARE VPL_RQ_EBUS_VPB_OUT SHARED CHARACTER 'd2' ;
+DECLARE VPL_EBUSPR_REPLY1 SHARED CHARACTER 'e2' ;
+DECLARE VPL_EBUSPR_REPLY_OUT SHARED CHARACTER 'f2' ;
+
+CREATE COMPUTE MODULE BalanceFlow_ProcessTransaction
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- This reference will simplify and speedup tree traversing...
+		DECLARE envRef,envlocRef,envOrigRef REFERENCE TO Environment;
+		CREATE FIELD Environment.Variables AS envRef;
+		CREATE FIELD envRef.MyLocation AS envlocRef;
+		DECLARE outRef REFERENCE TO OutputRoot;
+		DECLARE OutDataRef REFERENCE TO OutputRoot;
+		DECLARE inRef REFERENCE TO InputRoot.JSON.Data;
+		-- -- Check if for logging all messages is enabled
+		-- IF readFromCache('LogAllMessagesFlag', 'LogAllMessagesFlag') = '1' THEN
+		-- CALL CopyEntireMessage();
+		-- SET envlocRef.Transaction = 'BalanceFlow-'||inRef.optype||'-request';
+		-- SET OutputLocalEnvironment = InputLocalEnvironment;
+		-- PROPAGATE TO TERMINAL 'out2';
+		-- END IF;
+
+		CALL CopyMessageHeaders();
+		-- CALL CopyEntireMessage();
+		-- Set this so we know where we are...
+		SET envlocRef.FLOW = 'BalanceFlow';
+		SET envlocRef.MODULE = 'ProcessTransaction';
+		SET envlocRef.LEVEL = '451';
+		-- Need to pass this because of the node mode...
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+		-- We will need some fields info from the original message so save it...
+		SET envRef.OriginalJSONRequest = InputRoot;
+
+		DECLARE logVal CHARACTER;
+		DECLARE useWhitelist CHARACTER;
+		--used by logging flow
+		SET envlocRef.Transaction = 'BalanceFlow-'||inRef.optype||'-request';
+		-- Check that we do indeed have what we need...
+		IF inRef.org IS NULL OR InputRoot.HTTPInputHeader."X-Access-Token" IS NULL THEN
+			-- We do not have anything to Authorize so throw exception...
+			SET envlocRef.Ebuscode = '400';
+			SET envRef.MyLocation.DESC = 'Failed to Process. Invalid data. Need valid ORG, AuthToken.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Process. Invalid data. Need valid ORG, AuthToken.');
+		END IF;
+
+		IF inRef.org IS NULL OR InputRoot.HTTPInputHeader."X-Access-Token" IS NULL THEN
+			-- We do not have anything to Authorize so throw exception...
+			SET envlocRef.Ebuscode = '400';
+			SET envRef.MyLocation.DESC = 'Failed to Process. Invalid data. Need valid ORG, AuthToken.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Process. Invalid data. Need valid ORG, AuthToken.');
+		END IF;
+		-- This will hold the Institution profile retrieved from the cache. We use in processInstitutionTransaction...
+		DECLARE MyInstitutionProfile CHARACTER;
+		-- Check if the Cache is active, if not then we need to send a request to load the cache...
+		SET envRef.IsCacheActive = readFromCache('CacheActiveFlag', 'CacheActiveFlag');
+		-- Is the cache active? '1' means Yes, anything else means No...
+		IF envRef.IsCacheActive = '1' THEN
+			SET MyInstitutionProfile = readFromCache( 'Institution' || inRef.org, inRef.org);
+			--SET MyInstitutionProfile = ReplaceProfileOrg(MyInstitutionProfile,inRef.org);
+			-- Check if institution specific logging is enabled?
+			IF POSITION('logging' IN MyInstitutionProfile) > 0 THEN
+				SET logVal = SUBSTRING(MyInstitutionProfile FROM (POSITION('logging' IN MyInstitutionProfile )+9) FOR 1);
+			END IF;
+			-- Check if institution whitelist is enabled?
+			IF POSITION('usewhitelist' IN MyInstitutionProfile) > 0 THEN
+				SET useWhitelist = SUBSTRING(MyInstitutionProfile FROM (POSITION('usewhitelist' IN MyInstitutionProfile )+14) FOR 1);
+			END IF;
+			--Start: Logic to enable transaction logging , remember to set 'logging' map in cache to '1'before activating any of the below flags.
+			IF readFromCache('LogAllMessagesFlag', 'LogAllMessagesFlag') = '1' THEN
+				-- Logging is enabled for all transactions
+				SET envRef.logging = '1';
+			ELSE
+				-- Logging is enabled only for specific institution initiated transactions.
+				SET envRef.logging = COALESCE(logVal, '0');
+			END IF;
+			-- End
+			-- Check to see if we have the Institution... Get the Profile...
+			IF MyInstitutionProfile IS NOT NULL THEN
+
+				DECLARE authtoken CHARACTER;
+				-- Pass the token as well since the Product needs it...
+				SET authtoken = InputRoot.HTTPInputHeader."X-Access-Token";
+
+				DECLARE OkFlag BOOLEAN false;
+				DECLARE MyInstitutionTransaction CHARACTER;
+				DECLARE MyInstitutionUpdatedTransaction CHARACTER;
+				-- We need to pass the Transaction as a JSON string so we have to convert back to string from the blob result in ASBITSTREAM...
+				SET MyInstitutionTransaction = CAST(ASBITSTREAM(InputRoot.JSON.Data OPTIONS FolderBitStream CCSID InputRoot.Properties.CodedCharSetId ENCODING InputRoot.Properties.Encoding) AS CHARACTER CCSID InputRoot.Properties.CodedCharSetId ENCODING InputRoot.Properties.Encoding);
+				--check if institution profile has enabled whitelist verification
+				IF useWhitelist = '1' THEN
+					DECLARE ClientIP CHARACTER;
+					DECLARE MyClientIP CHARACTER;
+					SET ClientIP = COALESCE(InputRoot.HTTPInputHeader."X-Forwarded-For", '0.0.0.0');
+					SET MyClientIP = readFromCache( 'IP' || inRef.org, ClientIP);
+
+					IF MyClientIP = ClientIP THEN
+						-- For everything else. Check the transaction requirements are met... And also Authorize...
+						SET OkFlag = processInstitutionTransaction(authtoken, MyInstitutionProfile, MyInstitutionTransaction, MyInstitutionUpdatedTransaction);
+					ELSE
+						-- Cache is inactive... We have to reject...
+						SET envlocRef.Ebuscode = '402';
+						SET envlocRef.DESC = 'Failed to Authorize. Invalid Authorized IP.';
+						THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Authorize. Invalid Authorized IP.');
+					END IF;
+				ELSE
+					-- For everything else. Check the transaction requirements are met... And also Authorize...
+					SET OkFlag = processInstitutionTransaction(authtoken, MyInstitutionProfile, MyInstitutionTransaction, MyInstitutionUpdatedTransaction);
+				END IF;
+				-- Check what we got from validation... It worked...
+				IF OkFlag THEN
+					-- Pass the updated JSON along... Not as a string but as part of the tree...
+					CREATE LASTCHILD OF OutputRoot DOMAIN('JSON') PARSE(MyInstitutionUpdatedTransaction, InputRoot.Properties.Encoding, InputRoot.Properties.CodedCharSetId,'','','',FolderBitStream);
+
+					MOVE outRef TO OutputRoot.JSON.Data;
+					-- Pass the logging flag in JSON
+					SET outRef.logging = envRef.logging;
+					-- Pass the Profile since we checked it already...
+					SET outRef.institutionprofile = MyInstitutionProfile;
+
+					MOVE envOrigRef TO envRef.OriginalJSONRequest.JSON.Data;
+					-- Save these...
+					SET envOrigRef.org = outRef.org;
+					SET envOrigRef.logo = outRef.logo;
+					SET envOrigRef.memberid = outRef.memberid;
+					SET envOrigRef.accnum = outRef.accnum;
+					SET envOrigRef.optype = outRef.optype;
+					SET envOrigRef.intrefnum = outRef.intrefnum;
+					SET envOrigRef.institutionprofile = outRef.institutionprofile;
+
+					DELETE FIELD outRef.institutionprofile;
+
+					RETURN TRUE;
+				ELSE
+					DECLARE currentRcode CHARACTER '';
+					DECLARE currentErrorMessage CHARACTER '';
+					-- Couldn't get the transaction context... We have to reject...
+					--SET OutputLocalEnvironment.Destination.HTTP.ReplyStatusCode = '401';
+					SET envlocRef.Ebuscode= '401';
+					SET envlocRef.DESC = 'Failed to Process. Invalid ORG, Token or IP.';
+					SET envlocRef.Transaction = 'BalanceFlow-'||inRef.optype||'-response';
+					THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Process. Invalid ORG or Invalid Token.');
+				END IF;
+			ELSE
+				-- Invalid MerchantId or Token... We have to reject...
+				SET envlocRef.Ebuscode = '401';
+				SET envlocRef.DESC = 'Failed to Process. Could not retrieve user profile.';
+				THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Process. Could not retrieve user profile.');
+			END IF;
+		ELSE
+			-- Cache is inactive... We have to reject...
+			SET envlocRef.Ebuscode = '401';
+			SET envlocRef.DESC = 'Failed to Authorize. Cache is inactive.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Authorize. Cache is inactive.');
+		END IF;
+		-- ELSE --ClientIP was not in whitelist so block access
+		-- CREATE FIELD OutputRoot.JSON.Data AS OutDataRef;
+		-- SET OutDataRef.optype = inRef.optype;
+		-- SET OutDataRef.org = inRef.org;
+		-- SET OutDataRef.rcode = '04';
+		-- SET OutDataRef.rmsg = 'Invalid Access';
+		--
+		-- PROPAGATE TO TERMINAL 'out1';
+		--
+		-- RETURN FALSE;
+		-- END IF;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+
+	CREATE FUNCTION ReplaceProfileOrg (IN MyJSONProfile CHARACTER, IN orgNum CHARACTER)
+	RETURNS CHARACTER
+	BEGIN
+
+		DECLARE envRefJson,envjwt REFERENCE TO Environment.Variables;
+		CREATE FIELD Environment.Variables AS envRefJson;
+		DECLARE dataAsBit BIT CAST(MyJSONProfile AS BIT CCSID 1208);
+		CREATE LASTCHILD OF envRefJson.MyJSONProfile DOMAIN 'JSON' PARSE(dataAsBit CCSID 1208);
+		DECLARE aud,username,MyJSONProfileReturn ,jwtclaims CHARACTER;
+		MOVE envRefJson TO envRefJson.MyJSONProfile.JSON.Data;
+		SET jwtclaims = COALESCE(CAST (ASBITSTREAM(envRefJson.jwtclaims) AS CHARACTER CCSID 1208),'NA');
+		CREATE LASTCHILD OF envRefJson.jwtclaims DOMAIN 'JSON' PARSE(jwtclaims CCSID 1208);
+		MOVE envjwt TO envRefJson.jwtclaims.JSON.Data;
+		SET aud = envjwt.aud;
+		SET username = SUBSTRING(aud AFTER '-');
+		SET aud = orgNum ||'-'||username;
+		SET envRefJson.org=orgNum;
+		SET envRefJson.jwtclaims.aud = aud;
+		SET MyJSONProfileReturn = CAST(ASBITSTREAM(envRefJson) AS CHARACTER CCSID 1208);
+		RETURN MyJSONProfileReturn;
+
+	END;
+
+END MODULE;
+
+CREATE COMPUTE MODULE BalanceFlow_GetToken
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		DECLARE envRef,envlocRef,envkeysRef REFERENCE TO Environment;
+		CREATE FIELD Environment.Variables AS envRef;
+		CREATE FIELD envRef.MyLocation AS envlocRef;
+		DECLARE outRef REFERENCE TO OutputRoot;
+		DECLARE inRef REFERENCE TO InputRoot.JSON.Data;
+		-- -- Check if request login message logging is required?
+		-- IF readFromCache('LogAllMessagesFlag', 'LogAllMessagesFlag') = '1' THEN
+		-- CALL CopyEntireMessage();
+		-- SET envlocRef.Transaction = 'BalanceFlow-Login-request';
+		-- SET OutputLocalEnvironment = InputLocalEnvironment;
+		-- PROPAGATE TO TERMINAL 'out2';
+		-- END IF;
+
+		CALL CopyMessageHeaders();
+		-- Set this so we know where we are...
+		SET envlocRef.FLOW = 'BalanceFlow';
+		SET envlocRef.MODULE = 'BalanceFlow_GetToken';
+		SET envlocRef.LEVEL = '451';
+		--used by logging flow
+		SET envlocRef.Transaction = 'BalanceFlow-Login-response';
+		-- Need to pass this because of the node mode...
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+
+		CREATE FIELD OutputRoot.JSON.Data AS outRef;
+		-- Check that we do indeed receive something...
+		IF inRef.org IS NULL OR inRef.username IS NULL OR inRef.password IS NULL THEN
+			-- Couldn't insert so throw exception...
+			SET envlocRef.Ebuscode = '451';
+			SET envlocRef.DESC = 'Failed to Login. Invalid data. Need valid ORG, Username and Password.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Login. Invalid data. Need valid ORG, Username and Password.');
+		END IF;
+
+		IF CheckIsValidOrg (inRef.username, inRef.org) = FALSE THEN
+			-- Couldn't insert so throw exception...
+			SET envlocRef.Ebuscode = '451';
+			SET envlocRef.DESC = 'Failed to Login. Invalid Institution. Need valid ORG, Username and Password.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Login. Invalid data. Need valid ORG, Username and Password.');
+		END IF;
+
+
+		DECLARE MyInstitutionToken CHARACTER;
+		DECLARE MyInstitutionProfile CHARACTER;
+		DECLARE logVal CHARACTER;
+		DECLARE useWhitelist CHARACTER;
+		-- Check if the Cache is active, if not then we need to send a request to load the cache...
+		SET envRef.IsCacheActive = readFromCache('CacheActiveFlag', 'CacheActiveFlag');
+		-- Is the cache active? '1' means Yes, anything else means No...
+		IF envRef.IsCacheActive = '1' THEN
+			--CHANGE THIS TO RETRIEVE FROM DATABASE INSTEAD OF CACHE
+			SET MyInstitutionProfile = readFromCache( 'Institution' || inRef.org, inRef.org);
+			
+			--------------Multiple Tokens---------------------------------------------------------------
+--			IF MyInstitutionProfile <> 'NA' AND CONTAINS(MyInstitutionProfile,inRef.org||'-'||inRef.username)=FALSE THEN
+--				SET MyInstitutionProfile = ReplaceProfileOrgToken(MyInstitutionProfile,inRef.org);
+--			END IF;
+			--------------Multiple Tokens---------------------------------------------------------------
+			
+			-- Check if merchant specific logging is enabled?
+			IF POSITION('logging' IN MyInstitutionProfile) > 0 THEN
+				SET logVal = SUBSTRING(MyInstitutionProfile FROM (POSITION('logging' IN MyInstitutionProfile )+9) FOR 1);
+			END IF;
+			-- Check if institution whitelist is enabled?
+			IF POSITION('usewhitelist' IN MyInstitutionProfile) > 0 THEN
+				SET useWhitelist = SUBSTRING(MyInstitutionProfile FROM (POSITION('usewhitelist' IN MyInstitutionProfile )+14) FOR 1);
+			END IF;
+			--Start: Logic to enable transaction logging , remember to set 'logging' map in cache to '1'before activating any of the below flags.
+			IF readFromCache('LogAllMessagesFlag', 'LogAllMessagesFlag') = '1' THEN
+				-- Logging is enabled for all transactions
+				SET envRef.logging = '1';
+			ELSE
+				-- Logging is enabled only for specific institution initiated transactions.
+				SET envRef.logging = COALESCE(logVal, '0');
+			END IF;
+			-- End
+			-- Check to see if we have the Merchant... Get the Token and the Keys...
+			CREATE FIELD envRef.MyKeys AS envkeysRef;
+			--check if institution profile has enabled whitelist verification
+			IF useWhitelist = '1' THEN
+				DECLARE ClientIP CHARACTER;
+				DECLARE MyClientIP CHARACTER;
+				SET ClientIP = COALESCE(InputRoot.HTTPInputHeader."X-Forwarded-For", '0.0.0.0');
+				SET MyClientIP = readFromCache( 'IP' || inRef.org, ClientIP);
+
+				IF MyClientIP = ClientIP THEN
+					SET MyInstitutionToken = getInstitutionKeys(MyInstitutionProfile, inRef.username, inRef.password, inRef.org, envkeysRef);
+				ELSE
+					-- IP is not in whitelist... We have to reject...
+					SET envlocRef.Ebuscode = '402';
+					SET envlocRef.DESC = 'Failed to Authorize. Invalid Authorized IP.';
+					THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Authorize. Invalid Authorized IP.');
+				END IF;
+			ELSE
+				SET MyInstitutionToken = getInstitutionKeys(MyInstitutionProfile, inRef.username, inRef.password, inRef.org, envkeysRef);
+			END IF;
+			-- Check what we got for the token...
+			IF MyInstitutionToken <> 'NA' THEN
+				-- Update the cache...
+				IF (insertIntoCache('Institution' || inRef.org, inRef.org, envkeysRef.institutionUpdatedProfile) = FALSE) THEN
+					-- Couldn't insert so throw exception...
+					SET envlocRef.Ebuscode = '451';
+					SET envlocRef.DESC = 'Failed to Login. Could not Insert Institution into GlobalCache.';
+					THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Login. Could not Insert Institution into GlobalCache.');
+				END IF;
+				-- We need to update the DB with the values for the new keys...
+				SET envRef.updatedDBFlag = UpdateProfileKeys(inRef.username, envkeysRef.institutionPrivateKey, envkeysRef.institutionPublicKey, envkeysRef.institutionDateKey, envkeysRef.institutionJwtClaims);
+				-- We need this for the sync message...
+				SET outRef."map" = 'Institution' || inRef.org;
+				SET outRef."key" = inRef.org;
+				SET outRef."value" = envkeysRef.institutionUpdatedProfile;
+				-- We need this so we know it is only MQ headers...
+				DELETE FIELD OutputRoot.HTTPInputHeader;
+				-- Sync message... Goes out on out1 terminal...
+				PROPAGATE TO TERMINAL 'out1';
+				-- Recopy the headers after the PROAGATE without delete...
+				CALL CopyMessageHeaders();
+				-- Copy the token...
+				SET OutputRoot.HTTPReplyHeader."X-Access-Token" = MyInstitutionToken;
+
+				CREATE FIELD OutputRoot.JSON.Data AS outRef;
+				-- This goes back to requester...
+				SET outRef = inRef;
+				DELETE FIELD outRef.password;
+				DELETE FIELD outRef.authtoken;
+				SET outRef.rcode = '00';
+				SET outRef.rmsg = 'Success';
+				-- Go on...
+				RETURN TRUE;
+			ELSE
+				SET envlocRef.Ebuscode = '451';
+				SET envlocRef.DESC = 'Failed to Login. Could not generate token.';
+				THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Login. Could not generate token.');
+			END IF;
+		ELSE
+			-- Now we send back response for the client to try again...
+			SET envlocRef.Ebuscode = '451';
+			SET envlocRef.DESC = 'Failed to Login. Cache is not active.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Failed to Login. Cache is not active.');
+		END IF;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+
+
+	CREATE FUNCTION CheckIsValidOrg (IN UserName CHARACTER, IN InstitutionId CHARACTER)
+	RETURNS BOOLEAN
+	BEGIN
+
+		DECLARE envRef REFERENCE TO Environment.Variables;
+		CREATE FIELD Environment.Variables AS envRef;
+		DECLARE CurrentInstitution REFERENCE TO Environment;
+		CALL GetValidInstitutionListDB(UserName,envRef.DBResult.Institutions.Institution[]);
+		MOVE CurrentInstitution TO envRef.DBResult.Institutions.Institution;
+		DECLARE JSONValue CHARACTER CAST(CurrentInstitution.JSONValue AS CHARACTER);
+		DECLARE dataAsBit BIT CAST(JSONValue AS BIT CCSID 1208);
+		CREATE LASTCHILD OF envRef.JSONData DOMAIN 'JSON' PARSE(dataAsBit CCSID 1208);
+		DECLARE OrgNumbers CHARACTER;
+		SET OrgNumbers = COALESCE(envRef.JSONData.JSON.Data.OrgNumbers,'NA');
+		IF CONTAINS(OrgNumbers,InstitutionId) OR (OrgNumbers = InstitutionId )THEN
+			RETURN TRUE;
+		ELSE
+			RETURN FALSE;
+		END IF;
+
+	END;
+
+	CREATE FUNCTION ReplaceProfileOrgToken (IN MyJSONProfile CHARACTER, IN orgNum CHARACTER)
+	RETURNS CHARACTER
+	BEGIN
+
+		DECLARE envRefJson,envjwt REFERENCE TO Environment.Variables;
+		CREATE FIELD Environment.Variables AS envRefJson;
+		DECLARE dataAsBit BIT CAST(MyJSONProfile AS BIT CCSID 1208);
+		CREATE LASTCHILD OF envRefJson.MyJSONProfile DOMAIN 'JSON' PARSE(dataAsBit CCSID 1208);
+		DECLARE aud,username,MyJSONProfileReturn ,jwtclaims CHARACTER;
+		MOVE envRefJson TO envRefJson.MyJSONProfile.JSON.Data;
+		SET jwtclaims = COALESCE(CAST (ASBITSTREAM(envRefJson.jwtclaims) AS CHARACTER CCSID 1208),'NA');
+		CREATE LASTCHILD OF envRefJson.jwtclaims DOMAIN 'JSON' PARSE(jwtclaims CCSID 1208);
+		MOVE envjwt TO envRefJson.jwtclaims.JSON.Data;
+		SET aud = envjwt.aud;
+		SET username = SUBSTRING(aud AFTER '-');
+		SET aud = orgNum ||'-'||username;
+		SET envRefJson.org=orgNum;
+		SET envRefJson.jwtclaims.aud = aud;
+		SET MyJSONProfileReturn = CAST(ASBITSTREAM(envRefJson) AS CHARACTER CCSID 1208);
+		RETURN MyJSONProfileReturn;
+
+	END;
+
+
+END MODULE;
+
+CREATE COMPUTE MODULE BalanceFlow_GetException
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		--CALL CopyMessageHeaders();
+		DECLARE envlocRef REFERENCE TO Environment.Variables.MyLocation;
+		DECLARE envRef REFERENCE TO Environment.Variables;
+		DECLARE OutDataRef REFERENCE TO OutputRoot;
+		DECLARE OrigReqRef REFERENCE TO InputRoot.JSON.Data;
+		-- Need to pass this because of the node mode...
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+		-- Part-1: All in JSON format, to the Alerts Queue.
+		CREATE FIELD OutputRoot.JSON.Data AS OutDataRef;
+		SET OutDataRef = OrigReqRef;
+
+		DELETE FIELD OutDataRef.password;
+		DELETE FIELD OutDataRef.institutionprofile;
+		DELETE FIELD OutDataRef.authtoken;
+
+		SET envRef.OriginalJSONRequest.JSON.Data = OutDataRef;
+
+		DELETE FIELD OutputRoot.JSON.Data;
+		CREATE FIELD OutputRoot.JSON.Data AS OutDataRef;
+
+		SET OutDataRef.APP = 'VPLBFE';
+		SET OutDataRef.TYPE = COALESCE(envlocRef.TYPE, 'ERROR');
+		SET OutDataRef.LEVEL = COALESCE(envlocRef.LEVEL, '451');
+		SET OutDataRef.DATE = CAST(CURRENT_DATE AS CHARACTER FORMAT 'yyyyMMdd');
+		SET OutDataRef.TIME = CAST(CURRENT_TIME AS CHARACTER FORMAT 'HHmmss');
+		SET OutDataRef.DESC = COALESCE(envlocRef.DESC, 'For more info, see the RAW');
+		SET OutDataRef.FLOW = COALESCE(envlocRef.FLOW, 'BalanceFlow');
+		SET OutDataRef.MODULE = COALESCE(envlocRef.MODULE, '');
+		SET OutDataRef.TRANSACTION = OrigReqRef.optype ||'-'|| COALESCE(OrigReqRef.intrefnum, '000000') ||'-'|| COALESCE(OrigReqRef.memberid, 'NOMEMBERID') ||'-'|| COALESCE(OrigReqRef.accnum, 'NOACCNUM');
+		-- Include the Raw Exception...
+		SET OutDataRef.RAW = InputExceptionList;
+		-- IF you wanted the RAW as a string you would do this instead...
+		-- SET OutputRoot.JSON.Data.RAW = CAST(InputExceptionList AS CHARACTER CCSID InputRoot.Properties.CodedCharSetId Encoding InputRoot.Properties.Encoding));
+
+		PROPAGATE TO TERMINAL 'out1';
+		-- Part2: Send a response back to the client.
+		-- After a PROPAGATE without parameters the Output trees are cleared so we need to copy everything again...
+		CALL CopyMessageHeaders();
+		-- Need to pass this because of the node mode...
+		SET OutputLocalEnvironment = InputLocalEnvironment;
+
+		SET OutputLocalEnvironment.Destination.HTTP.ReplyStatusCode = '400';
+
+		CREATE FIELD OutputRoot.JSON.Data AS OutDataRef;
+		-- Now add a few of the fields we only have in the original request...
+		SET OutDataRef = OrigReqRef;
+		-- Delete the fields we do not want to go out...
+		DELETE FIELD OutDataRef.password;
+		DELETE FIELD OutDataRef.authtoken;
+		DELETE FIELD OutDataRef.logo;
+
+		SET OutDataRef.rcode = '04';
+		SET OutDataRef.rmsg = COALESCE(envlocRef.DESC, 'Unable To Process');
+
+		RETURN TRUE;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+END MODULE;
+
+CREATE COMPUTE MODULE BalanceFlow_GetAllProfilesFromDB
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		CALL CopyMessageHeaders();
+		DECLARE envRef, envlocRef REFERENCE TO Environment;
+		CREATE FIELD Environment.Variables AS envRef;
+		CREATE FIELD envRef.MyLocation AS envlocRef;
+		-- Set this so we know where we are...
+		SET envlocRef.FLOW = 'BalanceFlow';
+		--SET Environment.Variables.MyLocation.TYPE = 'INFO';
+		SET envlocRef.MODULE = 'GetAllProfilesFromDB';
+		SET envlocRef.LEVEL = '100';
+		-- These will be the cursors...
+		DECLARE CurrentInstitution REFERENCE TO Environment;
+		DECLARE CurrentIP REFERENCE TO Environment;
+		-- This we will us to optiize tree memory...
+		DECLARE CurrentPointer REFERENCE TO Environment;
+		-- These counts are for us to use during testing or debugging...
+		DECLARE InstitutionCount INTEGER 0;
+		DECLARE IPCount INTEGER 0;
+		-- Get the Merchant profiles from the DB... Store in the OutputTree so we can send if needed
+		CALL GetAllInstitutions(envRef.DBResult.Institutions.Institution[]);
+		-- Move the cursor to the first Merchant element... Will be NULL if there are no Merchants...
+		MOVE CurrentInstitution TO envRef.DBResult.Institutions.Institution;
+		-- Loop while there are Merchant to insert into the GlobalCache...
+		WHILE LASTMOVE(CurrentInstitution) DO
+			-- We will need this so we can delete the record once we process it...
+			SET CurrentPointer = CurrentInstitution;
+			DECLARE MyCurrentInstitutionId CHARACTER CAST(CurrentInstitution.org AS CHARACTER);
+			DECLARE MyCurrentInstitutionProfile CHARACTER CAST(CurrentInstitution.institutionprofile AS CHARACTER);
+			DECLARE dataAsBit BIT CAST(MyCurrentInstitutionProfile AS BIT CCSID 1208);
+			DELETE FIELD envRef.JSONData;
+			CREATE LASTCHILD OF envRef.JSONData DOMAIN 'JSON' PARSE(dataAsBit CCSID 1208);
+			DECLARE JSONValue CHARACTER 'NA';
+			SET JSONValue = COALESCE(envRef.JSONData.JSON.Data.JSONValue.OrgNumbers,'NA');
+			-- Insert, note the Map name is 'Merchant'...
+			IF JSONValue <> 'NA' THEN
+				CALL SplitOrgs(JSONValue,envRef,',');
+
+				FOR orgNum AS envRef.Split.Array[] DO
+					-- IF (insertIntoCache('Institution' || MyCurrentInstitutionId, MyCurrentInstitutionId, CurrentInstitution.institutionprofile) = FALSE) THEN
+					IF (insertIntoCache('Institution' || orgNum, orgNum, CurrentInstitution.institutionprofile) = FALSE) THEN
+						-- Couldn't insert so throw exception...
+						SET envlocRef.DESC = 'Could not Insert Institution into GlobalCache.';
+						THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Could not Insert Institution into GlobalCache.');
+					END IF;
+				END FOR;
+
+
+			END IF;
+			-- Let's see how many we've got...
+			SET InstitutionCount = InstitutionCount + 1;
+			-- Go to the next Merchant in the list...
+			MOVE CurrentInstitution NEXTSIBLING;
+			-- We do this to free memory...
+			DELETE FIELD CurrentPointer;
+
+		END WHILE;
+		---GET ALL WHITELIST IPS
+		-- Get the IP profiles from the DB... Store in the OutputTree so we can send if needed
+		CALL GetAllWhitelistIPs(envRef.DBResult.IPs.IP[]);
+		-- Move the cursor to the first Merchant element... Will be NULL if there are no Merchants...
+		MOVE CurrentIP TO envRef.DBResult.IPs.IP;
+		-- Loop while there are Merchant to insert into the GlobalCache...
+		WHILE LASTMOVE(CurrentIP) DO
+			-- We will need this so we can delete the record once we process it...
+			SET CurrentPointer = CurrentIP;
+
+			DECLARE MyCurrentIPId CHARACTER CAST(CurrentIP.WhitelistID AS CHARACTER);
+			DECLARE MyCurrentIPorg CHARACTER CAST(CurrentIP.org AS CHARACTER);
+			-- Insert, note the Map name is 'Merchant'...
+			IF (insertIntoCache('IP' || MyCurrentIPorg, CurrentIP.ClientIP, CurrentIP.ClientIP) = FALSE) THEN
+				-- Couldn't insert so throw exception...
+				SET envlocRef.DESC = 'Could not Insert IP into GlobalCache.';
+				THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Could not Insert IP into GlobalCache.');
+
+			END IF;
+			-- Let's see how many we've got...
+			SET IPCount = IPCount + 1;
+			-- Go to the next Merchant in the list...
+			MOVE CurrentIP NEXTSIBLING;
+			-- We do this to free memory...
+			DELETE FIELD CurrentPointer;
+
+		END WHILE;
+		-- These help us check the totals that were loaded into the cache...
+		SET OutputRoot.JSON.Data.InstitutionCount = CAST(InstitutionCount AS CHARACTER);
+		SET OutputRoot.JSON.Data.IPCount = CAST(IPCount AS CHARACTER);
+		-- Here we check that we indeed loaded the cache, we need at least one of every type...
+		IF InstitutionCount > 0 THEN
+			-- Insert, note the Map name is 'CacheActiveFlag'...
+			IF (insertIntoCache('CacheActiveFlag', 'CacheActiveFlag', '1') = FALSE) THEN
+				-- Couldn't insert so throw exception...
+				SET envlocRef.DESC = 'Could not Insert CacheActiveFlag into GlobalCache.';
+				THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('Could not Insert CacheActiveFlag into GlobalCache.');
+
+			END IF;
+		ELSE
+			-- Something is missing... Therefore the cache is not loaded completely...
+			SET envlocRef.DESC = 'The following are missing from the database. Institutions.';
+			THROW USER EXCEPTION CATALOG 'EvertecCatalog' MESSAGE 2951 VALUES('The following are missing from the database. Institutions.');
+
+		END IF;
+		-- Read the CacheActiveFlag to see if it was set correctly...
+		SET OutputRoot.JSON.Data.CacheActiveFlag = readFromCache( 'CacheActiveFlag', 'CacheActiveFlag');
+		-- All good...
+		RETURN TRUE;
+	END;
+
+	CREATE PROCEDURE CopyMessageHeaders() BEGIN
+		DECLARE I INTEGER 1;
+		DECLARE J INTEGER;
+		SET J = CARDINALITY(InputRoot.*[]);
+		WHILE I < J DO
+			SET OutputRoot.*[I] = InputRoot.*[I];
+			SET I = I + 1;
+		END WHILE;
+	END;
+
+	CREATE PROCEDURE CopyEntireMessage() BEGIN
+		SET OutputRoot = InputRoot;
+	END;
+
+	CREATE PROCEDURE SplitOrgs (IN S CHARACTER, IN Env REFERENCE, IN Delim CHARACTER)
+	BEGIN
+		DECLARE P INTEGER;
+		DECLARE Idx INTEGER 1;
+
+		SET Env.Split = NULL;
+
+		REPEAT
+			SET P = POSITION(Delim IN S);
+			IF P = 0 THEN
+				SET Env.Split.Array[Idx] = S;
+			ELSE
+				SET Env.Split.Array[Idx] = LEFT(S, P - 1);
+				SET S = SUBSTRING(S FROM P + LENGTH(Delim));
+				SET Idx = Idx + 1;
+			END IF;
+			UNTIL P = 0
+		END REPEAT;
+	END;
+END MODULE;
+
+CREATE PROCEDURE UpdateProfileKeys(IN UserName CHARACTER, IN PrivateKey CHARACTER, IN PublicKey CHARACTER, IN DateKey CHARACTER, IN JWTclaims CHARACTER)
+RETURNS BOOLEAN
+LANGUAGE DATABASE
+EXTERNAL NAME "dbo.ProfileRSAKeyInstitution";
+
+CREATE PROCEDURE GetAllInstitutions()
+LANGUAGE DATABASE
+DYNAMIC RESULT SETS 1
+EXTERNAL NAME "dbo.sp_ebus_vpl_all_inst_profile";
+
+CREATE PROCEDURE GetValidInstitutionListDB(IN UserName CHARACTER)
+LANGUAGE DATABASE
+DYNAMIC RESULT SETS 1
+EXTERNAL NAME "dbo.sp_ebus_vpl_get_valid_orgnums";
+
+CREATE PROCEDURE GetAllWhitelistIPs()
+LANGUAGE DATABASE
+DYNAMIC RESULT SETS 1
+EXTERNAL NAME "dbo.sp_ebus_vpl_all_whitelist";
+--CREATE PROCEDURE CheckWhitelist(IN ClientIP CHARACTER, IN Org CHARACTER)
+-- RETURNS BOOLEAN
+-- LANGUAGE DATABASE
+-- EXTERNAL NAME "dbo.sp_ebus_vpl_check_whitelist";
